@@ -1,0 +1,485 @@
+---
+title: ""
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+editor_options: 
+  chunk_output_type: console
+---
+
+![](esilv_png.png)
+
+# 1. Introduction
+
+Students: Berke ASLAN and William BOZZACCHI
+
+## Document content and description
+
+This document is the final output for the __ESILV, Year 5 Credit Scoring Project__. 
+
+The project below is done with the programming language R and the document generated with R Markdown. 
+
+# 2. Libraries et datasets
+
+## 2.1 Libraries
+
+```{r setup, echo=TRUE, message = FALSE, warning = FALSE}
+options(warn=-1)
+library(tidyverse)
+library(dplyr)
+library(knitr)
+library(skimr)
+library(lubridate)
+library(gridExtra)
+library(scorecard)
+library(ggplot2)
+library(ggplotify)
+library(plotly)
+library(questionr)
+library(caret)
+library(pROC)
+library(purrr)
+library(caTools)
+```
+
+## 2.2 Datasets
+
+Now let's import the dataset and check their given formats.
+
+```{r cars, echo=TRUE, message = FALSE, warning = FALSE}
+
+# Import dataset from the project directory
+raw_data <- read_csv("TD4Data.csv")
+data_dict <- read_csv("data_dictionary.csv")
+
+# Split dataset into train/test
+set.seed(101)
+train <- raw_data %>% sample_frac(.8)
+test <- anti_join(raw_data, train, by='UniqueID')
+
+# Summarize the datasets
+summary(train)
+summary(data_dict)
+```
+
+# 3. Le snorkeling
+
+## 3.0.1 Chargement des fichiers et premières impressions
+
+Let's use the library skim to work with our grouped dataset. 
+
+```{r pressure, echo=TRUE}
+skim(train)
+```
+
+Choissons quelques variables pour voir la structure de notre dataset.
+
+```{r data_structure, echo=TRUE}
+options(tibble.width = Inf) # displays all columns.
+
+# Check specific data structures
+train %>% dplyr::select(ltv, 
+                           disbursed_amount,
+                           "Date.of.Birth",
+                           supplier_id,
+                           "Employment.Type",
+                           "PERFORM_CNS.SCORE.DESCRIPTION",
+                           loan_default,
+                           "AVERAGE.ACCT.AGE",
+                           "CREDIT.HISTORY.LENGTH") %>%  head()
+```
+
+## 3.0.2 Echange avec les métiers
+
+Après cette première phase de snorkeling, nous avons pu constater la structure du dataset et les différentes variables. Cette première étape nous permet d’avoir une première idée des variables pertinentes. Nous avons aussi fait des changements sur le type des variables pour retyper les variables en factor pour les modalités.
+
+----
+
+# 4. Deep Dive
+
+## 4.1 Wrangling et mise en forme
+
+Dans cette phase, nous avons décidé de modifier la structure de la variable PERFORM_CNS.SCORE.DESCRIPTION. En effet, cette variable donne une description du score du bureau et présente 19 modalités différentes. Nous avons regroupé les modalités en quatre modalités plus larges de façon à rendre le calcul de la régression logistique plus efficace. Les quatre nouvelles modalités sont les suivantes : High, Low, Medium et Not Scored.
+
+Nous avons ensuite modifié les variables AVERAGE.ACCT.AGE et CREDIT.HISTORY.LENGTH représentant respectivement la durée moyenne des prêts et le temps écoulé depuis le premier prêt. Nous les avons convertis en nombre de mois à la place du format Xyrs Ymon. Cette modification nous permet d’avoir des variables numeric pour étudier leur impact. 
+
+De même pour les variables Date.of.Birth et DisbursalDate. Nous les avons respectivement convertis en BorrowerAge (Age de l’emprunteur) et NbrMonthRelation (Nombre de mois pour le décaissement) à la place du format Day/Month/Year. 
+
+En plottant les différentes variables, nous nous rendons compte que certaines variables ne sont pas pertinentes car elles n’apportent pas d’informations sur l’individu. C’est le cas des variables Passport.flag et MobileNo_Avl_Flag. En effet, l’ensemble des individus possède la même valeur pour ces deux variables ce qui les rend useless.
+
+```{r warngle, echo=TRUE}
+
+# Factor the drivers
+wrangled_train <- train %>% mutate(
+  Employment.Type =replace_na(train$Employment.Type,"None"),
+  State_ID = as.factor(State_ID),
+  loan_default = as.factor(loan_default),
+  VoterID_flag = as.factor(VoterID_flag),
+  supplier_id = as.factor(supplier_id),
+  manufacturer_id = as.factor(manufacturer_id),
+  Current_pincode_ID = as.factor(Current_pincode_ID),
+  MobileNo_Avl_Flag = as.factor(MobileNo_Avl_Flag),
+  Driving_flag = as.factor(Driving_flag),
+  Passport_flag = as.factor(Passport_flag)
+)
+
+# Factor the drivers
+wrangled_test <- test %>% mutate(
+  Employment.Type =replace_na(test$Employment.Type,"None"),
+  State_ID = as.factor(State_ID),
+  loan_default = as.factor(loan_default),
+  VoterID_flag = as.factor(VoterID_flag),
+  supplier_id = as.factor(supplier_id),
+  manufacturer_id = as.factor(manufacturer_id),
+  Current_pincode_ID = as.factor(Current_pincode_ID),
+  MobileNo_Avl_Flag = as.factor(MobileNo_Avl_Flag),
+  Driving_flag = as.factor(Driving_flag),
+  Passport_flag = as.factor(Passport_flag)
+)
+```
+
+On calcule les pourcentages en lignes avec la fonction lprop:
+
+```{r lprop, echo=TRUE}
+
+# Check data occurences
+wrangled_train %>% count(PERFORM_CNS.SCORE.DESCRIPTION)
+
+wrangled_train <- wrangled_train %>%
+  mutate(credit_category = case_when(
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "M-") ~ "High",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "F-") ~ "Low",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "D-") ~ "Low",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "K-") ~ "High",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "B-") ~ "Low",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "G-") ~ "Low",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "I-") ~ "Medium",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "Not Scored") ~ "Not Scored",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "A-") ~ "Low",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "C-") ~ "Low",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "No Bureau") ~ "Not Scored",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "E-") ~ "Low",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "H-") ~ "Medium",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "J-") ~ "High",
+    startsWith(PERFORM_CNS.SCORE.DESCRIPTION, "L-") ~ "High",
+  ))
+
+# Utilize lprop function to calculate percentages
+tab <- table(wrangled_train$PERFORM_CNS.SCORE.DESCRIPTION,wrangled_train$loan_default)
+lprop(tab)
+
+# Utilize lprop function to calculate percentages
+tab_prime <- table(wrangled_train$credit_category,wrangled_train$loan_default)
+lprop(tab_prime)
+```
+
+Parsing utilisant le regex.
+
+```{r parsing, echo=TRUE}
+
+# Calculate yrs mon parse to months
+wrangled_train <- wrangled_train %>%
+  mutate(AAA = 12 * as.numeric(str_extract(AVERAGE.ACCT.AGE, pattern="(\\d)+(?=yrs)")) + as.numeric(str_extract(AVERAGE.ACCT.AGE, pattern="(\\d)+(?=mon)")),
+         CHL = 12 * as.numeric(str_extract(CREDIT.HISTORY.LENGTH, pattern="(\\d)+(?=yrs)")) + as.numeric(str_extract(CREDIT.HISTORY.LENGTH, pattern="(\\d)+(?=mon)")))
+
+wrangled_train %>% select(AVERAGE.ACCT.AGE,
+                AAA,
+                CREDIT.HISTORY.LENGTH,
+                CHL)
+
+# Calculate yrs mon parse to months
+wrangled_test <- wrangled_test %>%
+  mutate(AAA = 12 * as.numeric(str_extract(AVERAGE.ACCT.AGE, pattern="(\\d)+(?=yrs)")) + as.numeric(str_extract(AVERAGE.ACCT.AGE, pattern="(\\d)+(?=mon)")),
+         CHL = 12 * as.numeric(str_extract(CREDIT.HISTORY.LENGTH, pattern="(\\d)+(?=yrs)")) + as.numeric(str_extract(CREDIT.HISTORY.LENGTH, pattern="(\\d)+(?=mon)")))
+
+
+```
+
+On calcule maintenant l'age de borrower et le nombre de mois en relation avec le disbursal date.
+
+```{r age_calc, echo=TRUE}
+
+# Insert function to calculate age
+# Transform character columns to date
+wrangled_train$Date.of.Birth <- dmy(wrangled_train$Date.of.Birth)
+wrangled_train$DisbursalDate <- dmy(wrangled_train$DisbursalDate)
+
+# diff_in_days = difftime(datetimes[2], datetimes[1], units = "days")
+
+wrangled_train <- wrangled_train %>% mutate(
+  BorrowerAge = MESS::age(Date.of.Birth, today()),
+  NbrMonthRelation = -1 * as.numeric(difftime(DisbursalDate, today(), units = "days") / 30)
+)
+
+wrangled_train %>% select(Date.of.Birth,
+                BorrowerAge,
+                DisbursalDate,
+                NbrMonthRelation)
+
+# Insert function to calculate age
+# Transform character columns to date
+wrangled_test$Date.of.Birth <- dmy(wrangled_test$Date.of.Birth)
+wrangled_test$DisbursalDate <- dmy(wrangled_test$DisbursalDate)
+
+# diff_in_days = difftime(datetimes[2], datetimes[1], units = "days")
+
+wrangled_test <- wrangled_test %>% mutate(
+  BorrowerAge = MESS::age(Date.of.Birth, today()),
+  NbrMonthRelation = -1 * as.numeric(difftime(DisbursalDate, today(), units = "days") / 30)
+)
+
+```
+
+```{r plot, echo=TRUE}
+library(gridExtra)
+
+# Grid plot ggplot
+
+p1 <- ggplot(wrangled_train, aes(x=AAA)) + geom_histogram()
+p2 <- ggplot(wrangled_train, aes(x=Aadhar_flag)) + geom_histogram()
+p3 <- ggplot(wrangled_train, aes(x=asset_cost)) + geom_histogram()
+p4 <- ggplot(wrangled_train, aes(x=BorrowerAge)) + geom_histogram()
+p5 <- ggplot(wrangled_train, aes(x=branch_id)) + geom_histogram()
+p6 <- ggplot(wrangled_train, aes(x=CHL)) + geom_histogram()
+p7 <- ggplot(wrangled_train, aes(x=DELINQUENT.ACCTS.IN.LAST.SIX.MONTHS)) + geom_histogram()
+p8 <- ggplot(wrangled_train, aes(x=disbursed_amount)) + geom_histogram()
+p9 <- ggplot(wrangled_train, aes(x=Employee_code_ID)) + geom_histogram()
+p10 <- ggplot(wrangled_train, aes(x=ltv)) + geom_histogram()
+p11 <- ggplot(wrangled_train, aes(x=NbrMonthRelation)) + geom_histogram()
+p12 <- ggplot(wrangled_train, aes(x=NEW.ACCTS.IN.LAST.SIX.MONTHS)) + geom_histogram()
+p13 <- ggplot(wrangled_train, aes(x=NO.OF_INQUIRIES)) + geom_histogram()
+p14 <- ggplot(wrangled_train, aes(x=PAN_flag)) + geom_histogram()
+p15 <- ggplot(wrangled_train, aes(x=PERFORM_CNS.SCORE)) + geom_histogram()
+p16 <- ggplot(wrangled_train, aes(x=PRI.ACTIVE.ACCTS)) + geom_histogram()
+p17 <- ggplot(wrangled_train, aes(x=PRI.CURRENT.BALANCE)) + geom_histogram()
+p18 <- ggplot(wrangled_train, aes(x=PRI.DISBURSED.AMOUNT)) + geom_histogram()
+p19 <- ggplot(wrangled_train, aes(x=PRI.NO.OF.ACCTS)) + geom_histogram()
+p20 <- ggplot(wrangled_train, aes(x=PRI.OVERDUE.ACCTS)) + geom_histogram()
+p21 <- ggplot(wrangled_train, aes(x=PRI.SANCTIONED.AMOUNT)) + geom_histogram()
+p22 <- ggplot(wrangled_train, aes(x=PRIMARY.INSTAL.AMT)) + geom_histogram()
+p23 <- ggplot(wrangled_train, aes(x=UniqueID)) + geom_histogram()
+
+grid.arrange(p1, p2, p3, p4,
+             p5, p6, p7, p8,
+             p9, p10, p11, p12,
+             p13, p14, p15, p16, 
+             p17, p18, p19, p20,
+             p21, p22, p23, ncol=3, nrow = 8)
+
+```
+
+Categoriel.
+
+```{r plot_cate, echo=TRUE}
+
+
+p1 <- ggplot(wrangled_train, aes(x=Current_pincode_ID)) + geom_histogram(stat="count")
+p2 <- ggplot(wrangled_train, aes(x=Driving_flag)) + geom_histogram(stat="count")
+p3 <- ggplot(wrangled_train, aes(x=loan_default)) + geom_histogram(stat="count")
+p4 <- ggplot(wrangled_train, aes(x=manufacturer_id)) + geom_histogram(stat="count")
+p5 <- ggplot(wrangled_train, aes(x=MobileNo_Avl_Flag)) + geom_histogram(stat="count")
+p6 <- ggplot(wrangled_train, aes(x=Passport_flag)) + geom_histogram(stat="count")
+p7 <- ggplot(wrangled_train, aes(x=State_ID)) + geom_histogram(stat="count")
+p8 <- ggplot(wrangled_train, aes(x=supplier_id)) + geom_histogram(stat="count")
+p9 <- ggplot(wrangled_train, aes(x=VoterID_flag)) + geom_histogram(stat="count")
+
+
+grid.arrange(p1, p2, p3, p4,
+             p5, p6, p7, p8,
+             p9, ncol=3, nrow = 3)
+
+
+```
+
+## 4.3 Sélection des variables pour le modèle
+
+
+### 4.3.1 Analyses univariées & bivariées
+
+En réalisant le boxplot de la variable BorrowerAge, nous nous rendons compte que la saisie d’une des individus est fausse. En effet, le boxplot nous indique qu’un individu a 135 ans ce qui est impossible. On observe aussi un outlier, un individu en défaut ayant 92 ans.
+
+```{r boxplots, echo=TRUE}
+
+boxplot(wrangled_train$BorrowerAge,main="Age de le borrower",
+        xlab="L ecart inter-quartile h", ylab="Heures",horizontal = FALSE)
+
+```
+
+Boxplot + violon plot.
+
+```{r plot_violon, echo=TRUE}
+
+p1 <- ggplot(wrangled_train, aes(x=wrangled_train$BorrowerAge)) + geom_boxplot() + xlab("BorrowerAge") + ylab("loan_default")
+
+p2 <- ggplot(wrangled_train, aes(x=wrangled_train$BorrowerAge, y=wrangled_train$loan_default)) + geom_boxplot() + xlab("BorrowerAge") + ylab("loan_default")
+
+p3 <- ggplot(wrangled_train, aes(x=wrangled_train$BorrowerAge, y=wrangled_train$loan_default))  + geom_violin()  + geom_boxplot(width=.1) + xlab("BorrowerAge") + ylab("loan_default")
+
+grid.arrange(p1, p2, p3, ncol=2, nrow = 2)
+
+```
+
+### 4.3.2 Discrétisation des variables
+
+Dans cette section nous discrétisons les variables afin de réaliser notre régression logistique. Cette étape présente une perte d’informations mais elle est nécessaire pour le calcul de la régression logistique dans la mesure où un nombre trop important de valeurs rend le calcul impossible. 
+
+Les différents graphes nous donnent des informations pertinentes sur l’impact des différentes variables dans notre modèle.
+
+Par exemple, le graphe de la variable ltv (Rapport prêt/valeur de l'actif) nous indique qu’il s’agit d’une variable croissante du défaut. La variable ltv a été discrétiser en trois classes [0 ; 55], [55, 85] et [85 ; inf]. Le pourcentage en bleu sur la courbe représente le rapport entre la proportion de rouge (bas) sur la population entière. 
+On observe que plus la ltv est importante et donc plus le prêt est important par rapport à la valeur de l’actif plus l’individu a des chances de faire défaut. 
+
+Le graphe de la PERFORM_CNS.SCORE.DESCRIPTION nous montre aussi qu’il s’agit d’une variable croissante du défaut. En effet, le ratio d’individu bad sur l’ensemble de la population augmente en fonction de la notation du bureau (on observe 56% de pour le score high ce qui signifie que plus d’un individu sur 2 fait défaut dans cette catégorie).
+
+```{r woebin_plot, echo=TRUE}
+
+to_plot_cat <- c("ltv", "disbursed_amount", "PRI.CURRENT.BALANCE",
+                   "PRI.DISBURSED.AMOUNT", "PRIMARY.INSTAL.AMT", "BorrowerAge",
+                   "AAA", "PERFORM_CNS.SCORE.DESCRIPTION", "PRI.OVERDUE.ACCTS",
+                   "DELINQUENT.ACCTS.IN.LAST.SIX.MONTHS")
+
+for(i in to_plot_cat)
+{
+bins = woebin(wrangled_train, y="loan_default", x=i,bin_num_limit=3)
+p1 = woebin_plot(bins)
+print(p1)
+}
+
+```
+
+### 4.3.3 Pouvoir discriminant des variables
+
+```{r information_value, echo=TRUE}
+
+iv = iv(wrangled_train, y = 'loan_default') %>%
+  as_tibble() %>%
+  mutate( info_value = round(info_value, 3) ) %>%
+  arrange( desc(info_value) )
+
+iv %>%
+  knitr::kable()
+
+```
+
+```{r woebin, echo=TRUE}
+
+# bins = woebin(wrangled_train, y = 'loan_default')
+
+data_woe = woebin_ply(wrangled_train, bins) %>% 
+  as_tibble()
+
+data_woe
+
+```
+
+
+### 4.3.4 Corrélations intra modèle (Étape optionnelle)
+
+La matrice de corrélation obtenue avec le V de Cramer nous permet de connaitre la corrélation des différentes variables avec loan_default. Dans un premier temps, nous avons calculé la corrélation de toutes les variables présentes dans notre dataset. Après une première étude des résultats, nous avons décidés d’écarter certaines variables n’étant pas assez corrélées avec la variable loan_default. Dans un second temps, nous avons réalisé à nouveau un V de Cramer avec nos variables sélectionnées et nous obtenons de nouvelles valeurs de corrélation. Nous observons que 3 variables ont une bonne corrélation avec la variable loan_default, il s’agit des variables ltv_bin, NbrMonthRelation_bin, et PERFORM_CNS.SCORE.DESCRIPTION_bin.
+
+Cependant la corrélation de la variable ltv avec loan_default_ ainsi qu’avec les autres variables semble être erroné malgré le sens de cette variable vis-à-vis de notre étude.
+
+Nous pouvons ainsi réaliser notre régression logistique avec ces variables.
+
+```{r cramer, echo=TRUE}
+
+# 
+# ALL_COLUMN_NAME <- wrangled_train %>% colnames()
+# 
+# ## Fonction de calcul d'un v de cramer
+# fCramerFunction = function(x,y) {
+#  tbl =  wrangled_train %>% select(x,y) %>% table()
+#  cramV = round(cramer.v(tbl), 2)
+#  data.frame(x, y, cramV) }
+# 
+# # create unique combinations of column names
+# # sorting will help getting a better plot (upper triangular)
+# df_comb = data.frame(t(combn(sort(c(ALL_COLUMN_NAME,"loan_default")), 2)), stringsAsFactors = F)
+# 
+# # apply function to each variable combination
+# df_res = purrr::map2_df(df_comb$X1, df_comb$X2, fCramerFunction)
+# 
+# df_res
+# 
+# # plot results
+# df_res %>%
+#  ggplot(aes(x,y,fill=cramV))+
+#  geom_tile()+
+#  geom_text(aes(x,y,label=cramV))+
+#  scale_fill_gradient(low="white", high="red")+
+#  theme_classic()+ theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+
+#############################################
+
+SELECTED_COLUMNS <- c("State_ID",
+  "PERFORM_CNS.SCORE.DESCRIPTION",
+  "PAN_flag",
+  "NbrMonthRelation",
+  "ltv",
+  "loan_default",
+  "Employment.Type",
+  "BorrowerAge",
+  "Aadhar_flag")
+
+small_df <- wrangled_train %>% select(
+  SELECTED_COLUMNS
+)
+
+fCramerFunction = function(x,y) {
+ tbl =  small_df %>% select(x,y) %>% table()
+ cramV = round(cramer.v(tbl), 2) 
+ data.frame(x, y, cramV) }
+
+df_comb = data.frame(t(combn(sort(c(SELECTED_COLUMNS,"loan_default")), 2)), stringsAsFactors = F)
+
+# apply function to each variable combination
+df_res = purrr::map2_df(df_comb$X1, df_comb$X2, fCramerFunction)
+
+df_res
+
+# plot results
+df_res %>%
+ ggplot(aes(x,y,fill=cramV))+
+ geom_tile()+
+ geom_text(aes(x,y,label=cramV))+
+ scale_fill_gradient(low="white", high="red")+
+ theme_classic()+ theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+```
+
+## 4.4 Régression logistique
+
+Enfin, nous avons sélectionné nos variables en calculant le pouvoir discriminant des variables grâce à l’information value ainsi que la corrélation des variables avec notre cible loan_default. En fonction des résultats obtenus, nous avons décidé de prendre 3 variables pour calculer notre régression, il s’agit des variables ltv, PERFORM_CNS.SCORE.DESCRIPTION et NbrMonthRelation. Au-delà du pouvoir discriminant et de la corrélation de ces variables, elles ont du sens vis-à-vis de notre cas d’étude, ce qui fait sens.
+
+Pour notre régression logistique, nous obtenons ce graphique avec une AUC = 0.6959. C’est une valeur élevée ce qui signifie que notre modèle est performant.
+
+```{r logistic_regression, echo=TRUE}
+
+feature_vars = c("ltv", "NbrMonthRelation", "PERFORM_CNS.SCORE.DESCRIPTION")
+
+glm_formulation_vars <- reformulate(termlabels = feature_vars,
+                              response="loan_default")
+
+
+logit = glm(glm_formulation_vars,
+            data=wrangled_train,
+            family=binomial(link="logit"))
+
+wrangled_test$Score = predict(logit,
+                                  newdata = wrangled_test,
+                                  type="response")
+
+roc_obj = roc(wrangled_test$loan_default ~ wrangled_test$Score,
+          plot=TRUE, percent=TRUE, auc=TRUE)
+
+roc_obj$auc
+
+```
+
+
+```{r density, echo=TRUE}
+
+ggplot(wrangled_test, aes(x=Score, color=loan_default)) + geom_density()
+
+```
